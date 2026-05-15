@@ -24,6 +24,126 @@ nginx-postgres-mcp.conf  # Nginx reverse proxy config
 
 ---
 
+## Local development guide
+
+### Step 1 — Clone the repo
+
+```bash
+git clone https://github.com/MohitKapoor19/custom-mcp-server.git
+cd custom-mcp-server
+```
+
+### Step 2 — Create a virtual environment
+
+```bash
+# Windows
+python -m venv venv
+venv\Scripts\activate
+
+# Mac/Linux
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### Step 3 — Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Step 4 — Create your `.env`
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and fill in your database credentials. You only need to fill in the databases you want to test — unconfigured ones are skipped automatically.
+
+For local dev, `API_TOKEN` can be left empty (auth is skipped when the token is blank).
+
+### Step 5 — Run the server
+
+```bash
+python server.py --transport http
+```
+
+Server starts at `http://localhost:8000`. The MCP endpoint is `http://localhost:8000/mcp`.
+
+### Step 6 — Test a tool call manually
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "list_databases",
+      "arguments": {}
+    }
+  }'
+```
+
+### Step 7 — Test with Claude Desktop (optional)
+
+Add this to your Claude Desktop config (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "postgres-mcp": {
+      "command": "python",
+      "args": ["C:/path/to/custom-mcp-server/server.py", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop — the tools will appear automatically.
+
+### Editing business rules
+
+`context.json` is read from disk on **every tool call** — no restart needed. Just edit and save:
+
+```
+context.json
+├── _db_registry        ← add/rename databases here
+├── online              ← rules for online_lms
+│   ├── _global_rules   ← applies to every query in this ruleset
+│   └── <table_name>    ← per-table rules
+└── regular             ← rules for regular_lms, regular_cgc_lms, regular_amity_lms
+    ├── _global_rules
+    └── <table_name>
+```
+
+### Adding a new tool
+
+Add a new `@mcp.tool` function anywhere in `server.py`:
+
+```python
+@mcp.tool
+async def my_tool(db_name: str, param: str) -> str:
+    """Description shown to Claude."""
+    pool = await get_pool(db_name)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT ...", param)
+    return json.dumps({"_source_db": db_name, "results": rows_to_dicts(rows)}, default=str)
+```
+
+Restart the server — FastMCP auto-registers it, no other wiring needed.
+
+### Pushing changes
+
+```bash
+git add server.py context.json  # or whichever files changed
+git commit -m "your message"
+git push
+```
+
+---
+
 ## Deployment guide (Hostinger VPS)
 
 ### Prerequisites

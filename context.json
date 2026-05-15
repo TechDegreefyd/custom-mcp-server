@@ -1,0 +1,284 @@
+{
+  "_db_registry": {
+    "online_lms":        { "ruleset": "online",  "description": "Online Lead Management System" },
+    "regular_lms":       { "ruleset": "regular", "description": "Regular LMS" },
+    "regular_cgc_lms":   { "ruleset": "regular", "description": "Regular LMS — CGC University" },
+    "regular_amity_lms": { "ruleset": "regular", "description": "Regular LMS — Amity University" }
+  },
+
+  "online": {
+    "_global_rules": {
+      "description": "Universal rules that apply to EVERY query in the Online LMS database.",
+      "rules": [
+        "TIMEZONE: All created_at/updated_at store UTC. IST = UTC+5:30. Day filter: WHERE created_at >= CURRENT_DATE - interval '5 hours 30 minutes' AND created_at < CURRENT_DATE + interval '1 day' - interval '5 hours 30 minutes'. callback_date is type DATE — NEVER apply timezone offset to it.",
+        "COUNTING: ALWAYS COUNT(DISTINCT student_id) — NEVER COUNT(*) after JOIN or on append-only tables.",
+        "OUTPUT: Stage breakdowns = wide/pivot format (CASE WHEN per stage, one row per entity). NEVER long format. NEVER add LIMIT unless user says 'top N' or superlative. NEVER return student_phone. List queries must have ORDER BY.",
+        "COUNSELLORS: ALWAYS JOIN counsellors for counsellor_name — never construct from other columns. Filter by name with ILIKE '%Name%' after JOIN — never on base table. NEVER OR across two counsellor FK columns in one JOIN.",
+        "CHILD SAFETY: If students table is NOT JOINed in a query, add: AND student_id IN (SELECT student_id FROM students).",
+        "FUNNEL ROUTING: 'Pre Application' / 'Initial Counselling Completed' / NI before app → students.current_student_status. Application / Admission / Document Pending / Document Submitted / Enrolled / NI after app → course_status_journeys.course_status. Shortlisted → latest_course_statuses.is_shortlisted = true.",
+        "ADMISSION vs ENROLLED: 'admission'/'admitted' = course_status IN ('Admission','Enrolled') AND (course_status='Enrolled' OR fee_type NOT IN ('partial paid','Partially Paid','Partial Done')). 'enrolled'/'enrollment count' = course_status='Enrolled' ONLY.",
+        "DATE-BOUNDED STAGE COUNTS: ALWAYS deduplicate with MIN(created_at) per (student_id, course_id) FIRST — then apply date filter. NEVER filter raw created_at on course_status_journeys.",
+        "ICC COUNT: COUNT(DISTINCT student_id) WHERE \"first_Icc_Date\" IS NOT NULL from students. NEVER use current_student_status='Initial Counselling Completed' for ICC count.",
+        "PERFORMANCE (counsellor): success/efficiency = COUNT(calling_status='Connected') / COUNT(remark_id) from student_remarks. NOT student conversion rate.",
+        "FEES: Course price → university_courses.total_fees. Deposit actually paid → course_status_journeys.deposit_amount (requires dedup CTE). NEVER interchange. Study mode → university_courses.study_mode (never students.mode)."
+      ]
+    },
+    "students": {
+      "description": "Master leads table. One row per student/lead. Covers only early funnel stages.",
+      "rules": [
+        "current_student_status covers ONLY: 'Pre Application', 'Initial Counselling Completed', 'NotInterested' (before application). For Application and beyond → use course_status_journeys.",
+        "\"first_Icc_Date\" is case-sensitive — MUST be double-quoted in SQL. ICC count: SELECT COUNT(*) FROM students WHERE \"first_Icc_Date\" IS NOT NULL.",
+        "preferred_university and preferred_course are PostgreSQL arrays. Search: 'Name' = ANY(preferred_course).",
+        "Counsellor FKs: assigned_counsellor_id = L2 (use for all general counsellor queries). assigned_counsellor_l3_id = L3 (only when user specifies L3). enrollment_counsellor_id = enrollment phase only.",
+        "students.mode = student preference ('Online'/'Regular') — NOT course delivery. For course/university delivery mode → university_courses.study_mode.",
+        "University-level student counts: NEVER query directly from students. Join chain: students → latest_course_statuses → university_courses.",
+        "Fresh leads TODAY = students created within IST day window (on created_at). NEVER filter by current_student_status='Fresh' for date-scoped queries.",
+        "is_connected_yet = L2 connected. is_connected_yet_l3 = L3 connected. 'calls connected' = student_remarks.calling_status='Connected' (different concept).",
+        "NI sub-reasons are in current_student_ni_sub_status (only populated when current_student_status='NotInterested')."
+      ]
+    },
+    "counsellors": {
+      "description": "Staff and partner counsellors. One row per person.",
+      "rules": [
+        "role values: 'l2' (default L2 counsellor), 'l3', 'to' (team owner/supervisor), 'admission_to', 'enrollment_counsellor'.",
+        "assigned_to = manager's counsellor_id (self-referential FK). Team of a manager: WHERE assigned_to = '<manager_counsellor_id>'.",
+        "All-teams query (no manager named): filter WHERE manager.role='to'. If specific manager named → do NOT add role filter.",
+        "Team call metrics pattern: manager LEFT JOIN counsellors team_member ON manager.counsellor_id=team_member.assigned_to LEFT JOIN student_remarks ON team_member.counsellor_id=sr.counsellor_id. Never route through students for call metrics.",
+        "Never add counsellors.status='active' filter unless user says 'active counsellors'. Never add is_partner filter unless user says 'internal'/'partner'/'external'."
+      ]
+    },
+    "student_remarks": {
+      "description": "Append-only call log. One row per call attempt, multiple per student.",
+      "rules": [
+        "calling_status: 'Connected' or 'Not Connected'. Success rate = ROUND(COUNT(CASE WHEN calling_status='Connected' THEN 1 END)*100.0 / NULLIF(COUNT(remark_id),0), 2).",
+        "Count calls = COUNT(remark_id). Count distinct students contacted = COUNT(DISTINCT student_id). Never COUNT(*).",
+        "callback_date is type DATE — NEVER apply timezone offset. Overdue: callback_date < CURRENT_DATE. Upcoming: callback_date >= CURRENT_DATE. Count by remark_id, not student_id.",
+        "Latest remark per student: DISTINCT ON (student_id) ORDER BY student_id, created_at DESC.",
+        "Login = MIN(created_at AT TIME ZONE 'Asia/Kolkata'). Logout = MAX. Hourly: EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata').",
+        "Dormant students: HAVING MAX(sr.created_at) < CURRENT_DATE - INTERVAL '7 days' OR MAX(sr.created_at) IS NULL. Include student_email and counsellor_name in dormant queries.",
+        "For team call metrics: join directly counsellors → student_remarks. Do NOT join through students unless student-level data is also needed."
+      ]
+    },
+    "university_courses": {
+      "description": "Master course catalog. One row per course offering.",
+      "rules": [
+        "ALWAYS use ILIKE '%name%' for university_name — spellings vary.",
+        "study_mode = course delivery ('Online','Regular','Hybrid'). NEVER use students.mode for course or university analysis.",
+        "Fee columns: total_fees = catalog/course price. semester_fees = per-semester. annual_fees = per-year. Actual payment collected → course_status_journeys.deposit_amount.",
+        "University + location qualifier: use AND, never OR. E.g.: university_name ILIKE '%Chandigarh%' AND university_name ILIKE '%Lucknow%'.",
+        "status filter ('active'/'inactive'): only add when user asks for 'available' or 'active' courses."
+      ]
+    },
+    "latest_course_statuses": {
+      "description": "Current application status snapshot per student-course pair. One row per student × course.",
+      "rules": [
+        "Use ONLY for shortlisted courses/universities: is_shortlisted = true.",
+        "Payment check: latest_course_status ILIKE '%Paid%'.",
+        "For Application, Admission, Enrolled, NotInterested (after application) → use course_status_journeys, NOT this table.",
+        "created_by = counsellor who shortlisted the course."
+      ]
+    },
+    "course_status_journeys": {
+      "description": "APPEND-ONLY audit trail. Multiple rows per student-course. Primary table for Application, Admission, Documents, Enrolled, NI after application.",
+      "rules": [
+        "Multiple statuses in pivot: DISTINCT ON (student_id, course_id, course_status) ORDER BY student_id, course_id, course_status, created_at ASC — then date filter on outer query.",
+        "APPEND-ONLY: ALWAYS COUNT(DISTINCT student_id). If students not JOINed add: AND student_id IN (SELECT student_id FROM students).",
+        "Admission partial exclusion (apply to EVERY query where course_status='Admission'): AND fee_type NOT IN ('partial paid','Partially Paid','Partial Done'). Do NOT apply this to 'Enrolled'.",
+        "'admission'/'admitted' filter: course_status IN ('Admission','Enrolled') AND (course_status='Enrolled' OR fee_type NOT IN ('partial paid','Partially Paid','Partial Done')).",
+        "'enrolled' filter: course_status='Enrolled' ONLY.",
+        "Date-bounded count (any status): WITH first_event AS (SELECT student_id, course_id, MIN(created_at) AS first_event_date FROM course_status_journeys WHERE course_status='<status>' AND student_id IN (SELECT student_id FROM students) GROUP BY student_id, course_id) SELECT COUNT(DISTINCT student_id) FROM first_event WHERE first_event_date >= CURRENT_DATE - interval '5 hours 30 minutes' AND first_event_date < CURRENT_DATE + interval '1 day' - interval '5 hours 30 minutes'.",
+        "Deposit dedup CTE (ALWAYS use before SUM(deposit_amount)): SELECT DISTINCT ON (student_id, course_id, deposit_amount, fee_type, created_at::DATE) student_id, course_id, deposit_amount, INITCAP(TRIM(fee_type)) AS fee_type_clean FROM course_status_journeys WHERE deposit_amount > 0 AND student_id IN (SELECT student_id FROM students) ORDER BY student_id, course_id, deposit_amount, fee_type, created_at::DATE, created_at.",
+        "fee_type raw values (normalize with INITCAP+TRIM): 'Annual Paid','Semester Paid','Semester fee paid','partial paid','Partially Paid','Partial Done','Registration done','one year fee paid','1st Year Fee Paid','full fee paid'.",
+        "Latest status per student-course: DISTINCT ON (student_id, course_id) ORDER BY student_id, course_id, created_at DESC."
+      ]
+    },
+    "student_lead_activities": {
+      "description": "Marketing touchpoints only. One row per activity per student.",
+      "rules": [
+        "Marketing/campaign analysis ONLY. NEVER count students or funnel stages from this table.",
+        "'Leads from Facebook' → students.source ILIKE 'FaceBook%'. 'Activities from Facebook' → this table's source ILIKE 'FaceBook%'.",
+        "Campaign queries: utm_campaign ILIKE '%X%'. NEVER students.source for campaign queries.",
+        "Geographic: ip_city column. One city per student: SELECT student_id, MAX(ip_city) FROM student_lead_activities WHERE ip_city IS NOT NULL AND ip_city != '' GROUP BY student_id.",
+        "working_professional BOOLEAN — use for working professional filters in activity context, not students.current_profession."
+      ]
+    },
+    "counsellor_break_logs": {
+      "description": "Break sessions per counsellor. One row per break.",
+      "rules": [
+        "Ongoing break: break_end IS NULL. duration/duration_seconds/duration_formatted only populated after break ends.",
+        "Always apply IST offset when filtering on break_start or break_end."
+      ]
+    },
+    "lead_assignment_log": {
+      "description": "Audit trail of lead assignments. One row per assignment event.",
+      "rules": [
+        "Multiple rows per student_id — student can be reassigned. Use MAX(created_at) or latest row for current assignment.",
+        "assigned_by values: 'Ruleset Based' or 'Manual'."
+      ]
+    },
+    "l2_assignment_rulesets": {
+      "description": "Lead assignment rules for L2 counsellors.",
+      "rules": [
+        "conditions is JSONB — use ->> or @> to filter. assigned_counsellor_ids is text[] — use ANY() or @>.",
+        "Only query active rules (is_active=true) unless user asks for inactive/all."
+      ]
+    },
+    "admission_assignment_rulesets": {
+      "description": "Lead assignment rules for admission counsellors.",
+      "rules": [
+        "university_name is text[] — use 'Uni Name' = ANY(university_name). assigned_counsellor_ids is text[] — use ANY().",
+        "course_conditions is JSONB with keys: level, degree, stream, courseName, specialization.",
+        "Only query is_active=true unless user asks for inactive/all."
+      ]
+    }
+  },
+
+  "regular": {
+    "_global_rules": {
+      "description": "Universal rules that apply to EVERY query in Regular LMS databases (regular_lms, regular_cgc_lms, regular_amity_lms).",
+      "rules": [
+        "TIMEZONE: All created_at/updated_at store UTC. IST = UTC+5:30. Day filter: WHERE created_at >= CURRENT_DATE - interval '5 hours 30 minutes' AND created_at < CURRENT_DATE + interval '1 day' - interval '5 hours 30 minutes'. callback_date is type DATE — NEVER apply timezone offset to it.",
+        "COUNTING: ALWAYS COUNT(DISTINCT student_id) — NEVER COUNT(*) after JOIN or on append-only tables.",
+        "OUTPUT: Stage breakdowns = wide/pivot format (CASE WHEN per stage, one row per entity). NEVER long format. NEVER add LIMIT unless user says 'top N' or superlative. NEVER return student_phone. List queries must have ORDER BY.",
+        "PERCENTAGES: ALWAYS append || '%' to every rate/percentage column. ROUND(...,2) || '%' AS rate. NEVER return a bare decimal for percentages.",
+        "DEFAULT COUNSELLOR = L2: Any query without explicit level → ALWAYS L2. Join via students.assigned_counsellor_id, filter counsellors.role = 'l2'. No exceptions.",
+        "L3 COUNSELLORS: Only when user says 'L3'/'l3 counsellor'/'admission counsellor'. Join ALWAYS via course_status_journeys.assigned_l3_counsellor_id → counsellors WHERE role='l3'. NEVER use students.assigned_counsellor_l3_id for performance metrics — sparsely populated. course_status_journeys.counsellor_id = who LOGGED the event, NOT the assigned L3.",
+        "TEAM OWNER FILTER: ALWAYS use role ILIKE '%to%' — covers both 'to' (L2 owners) and 'to_l3' (L3 owners). NEVER role='to' alone.",
+        "CALL METRICS: For call queries joining counsellors+student_remarks ALWAYS add c.role='l2' AND c.status='active'. Never pull team owners, L3, inactive, or suspended counsellors unless explicitly asked.",
+        "COUNSELLORS: ALWAYS JOIN counsellors for counsellor_name. Filter by name with ILIKE '%Name%' after JOIN. NEVER filter by name on base table. NEVER OR across two counsellor FK columns in one JOIN.",
+        "CHILD SAFETY: If students table is NOT JOINed, add: AND student_id IN (SELECT student_id FROM students).",
+        "FUNNEL ROUTING: Pre Application / ICC / NI before app → students.current_student_status. Application (8-status IN list) / Admission / Documents / Enrolled / NI after app → course_status_journeys.course_status. Shortlisted → latest_course_statuses.latest_course_status = 'Shortlisted'.",
+        "APPLICATION IN LIST (Regular LMS — NEVER use course_status='Application'): course_status IN ('Form Submitted – Portal Pending','Form Submitted – Completed','Walkin Completed','Walkin Marked','Exam/Interview Scheduled','Offer Letter/Results Pending','Offer Letter/Results Released','Ready For Admission').",
+        "ADMISSION vs ENROLLED: 'admission'/'admitted' = course_status IN ('Admission','Enrolled') AND fee_type NOT IN ('Partial Done','Partial Paid','Partially Paid'). 'enrolled' = course_status='Enrolled' ONLY.",
+        "DATE-BOUNDED STAGE COUNTS: ALWAYS deduplicate with MIN(created_at) per (student_id, course_id) FIRST — then apply date filter. NEVER filter raw created_at on course_status_journeys. Exception for admission by time period: use MIN per student_id ONLY (see course_status_journeys rules).",
+        "REGION: 'region'/'region wise'/'Punjab region' always means university_courses.university_state. NEVER students.student_current_state or students.preferred_state.",
+        "ICC COUNT: COUNT(DISTINCT student_id) WHERE first_icc_date IS NOT NULL from students. first_icc_date is lowercase no quotes (Regular LMS).",
+        "FEES: Course price → university_courses.total_fees. Deposit paid → course_status_journeys.deposit_amount (requires dedup CTE). Never interchange. Study mode → university_courses.study_mode (never students.mode)."
+      ]
+    },
+    "students": {
+      "description": "Master leads table. One row per student/lead. Covers only early funnel stages (L2 territory).",
+      "rules": [
+        "current_student_status covers ONLY: 'Pre Application', 'Initial Counselling Completed', 'NotInterested' (before application). Application and beyond → course_status_journeys.",
+        "first_icc_date is LOWERCASE, no quotes. ICC count: SELECT COUNT(*) FROM students WHERE first_icc_date IS NOT NULL. (Contrast: Online LMS uses double-quoted \"first_Icc_Date\".)",
+        "Array columns (use ANY()): preferred_university, preferred_stream, preferred_degree, preferred_level, preferred_specialization, preferred_city, preferred_state. E.g.: 'MBA' = ANY(preferred_degree).",
+        "Counsellor FKs: assigned_counsellor_id = L2 (default for ALL general queries). assigned_counsellor_l3_id = L3 (sparsely populated — do NOT use for L3 performance metrics, use course_status_journeys.assigned_l3_counsellor_id instead). assigned_team_owner_id = team owner.",
+        "students.mode = student preference ('Regular' default) — NOT course delivery. For course delivery → university_courses.study_mode.",
+        "University-level counts: NEVER query directly from students. Join chain: students → latest_course_statuses → university_courses.",
+        "Fresh leads TODAY = created_at within IST day window. NEVER filter current_student_status='Fresh' for date-scoped queries.",
+        "is_connected_yet = L2 has connected (boolean). is_connected_yet_l3 = L3 has connected. 'call connected' = student_remarks.calling_status='Connected' — different concept.",
+        "NI sub-reasons in current_student_ni_sub_status (only when current_student_status='NotInterested')."
+      ]
+    },
+    "counsellors": {
+      "description": "Staff and partner counsellors. One row per person.",
+      "rules": [
+        "role values: 'l2' (L2 counsellor, pre-app), 'l3' (L3 counsellor, application/admission), 'to' (L2 team owner), 'to_l3' (L3 team owner).",
+        "Team owner filter: ALWAYS role ILIKE '%to%' — covers 'to' AND 'to_l3'. NEVER role='to' alone.",
+        "assigned_to = manager's counsellor_id (self-referential). Team of a manager: WHERE assigned_to = '<manager_counsellor_id>'.",
+        "All-teams query (no manager named): WHERE manager.role ILIKE '%to%'. If specific manager named → do NOT add role filter.",
+        "For L3 queries: join via course_status_journeys.assigned_l3_counsellor_id, filter counsellors.role='l3'. NEVER use students.assigned_counsellor_l3_id for L3 attribution. L3 is per COURSE — one student can have different L3 per course.",
+        "Call-metric queries: ALWAYS add c.role='l2' AND c.status='active' when joining counsellors to student_remarks. Never pull TO, to_l3, l3, inactive, or suspended into call metrics unless explicitly asked.",
+        "Never add counsellors.status='active' filter unless user says 'active counsellors'. Never add is_partner filter unless user says 'internal'/'partner'/'external'."
+      ]
+    },
+    "student_remarks": {
+      "description": "Append-only call log. One row per call attempt, multiple per student.",
+      "rules": [
+        "calling_status: 'Connected' or 'Not Connected'. Success rate = ROUND(COUNT(CASE WHEN calling_status='Connected' THEN 1 END)*100.0 / NULLIF(COUNT(remark_id),0), 2) || '%'.",
+        "Count calls = COUNT(remark_id). Count distinct students = COUNT(DISTINCT student_id). Never COUNT(*).",
+        "isdisabled column: filter isdisabled = false for active remarks only.",
+        "callback_date is type DATE — NEVER apply timezone offset. Overdue: callback_date < CURRENT_DATE. Upcoming: callback_date >= CURRENT_DATE. Count by remark_id not student_id.",
+        "Latest remark per student: DISTINCT ON (student_id) ORDER BY student_id, created_at DESC.",
+        "Login = MIN(created_at AT TIME ZONE 'Asia/Kolkata'). Logout = MAX. Hourly: EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata').",
+        "Dormant: HAVING MAX(sr.created_at) < CURRENT_DATE - INTERVAL '7 days' OR MAX(sr.created_at) IS NULL. Include student_email and counsellor_name in dormant queries.",
+        "Always add c.role='l2' AND c.status='active' when joining counsellors for call metrics — never include TO/l3/inactive/suspended unless asked."
+      ]
+    },
+    "university_courses": {
+      "description": "Master course catalog. One row per course offering.",
+      "rules": [
+        "ALWAYS use ILIKE '%name%' for university_name — spellings vary.",
+        "university_state = geographic region of the university. 'region'/'region wise'/'Punjab region' → GROUP BY university_state. NEVER students.student_current_state.",
+        "study_mode = course delivery ('Online','Regular','Hybrid'). NEVER use students.mode for course analysis.",
+        "Fee columns: total_fees = catalog price, semester_fees = per-semester, annual_fees = per-year. Actual deposit paid → course_status_journeys.deposit_amount.",
+        "University + location qualifier: use AND not OR. E.g.: university_name ILIKE '%Chandigarh%' AND university_name ILIKE '%Lucknow%'.",
+        "status filter: only when user asks for 'available' or 'active' courses."
+      ]
+    },
+    "latest_course_statuses": {
+      "description": "Current application status snapshot per student-course pair. One row per student × course.",
+      "rules": [
+        "Shortlisted (Regular LMS): latest_course_status = 'Shortlisted'. (NOT is_shortlisted=true — that is Online LMS.)",
+        "Payment check: latest_course_status ILIKE '%Paid%'.",
+        "For Application, Admission, Enrolled, NotInterested (after application) → use course_status_journeys.",
+        "created_by = counsellor who shortlisted the course."
+      ]
+    },
+    "course_status_journeys": {
+      "description": "APPEND-ONLY audit trail. Multiple rows per student-course. Primary table for Application (8 statuses), Admission, Documents, Enrolled, NI after application. L3 territory.",
+      "rules": [
+        "APPEND-ONLY: ALWAYS COUNT(DISTINCT student_id). If students not JOINed add: AND student_id IN (SELECT student_id FROM students).",
+        "APPLICATION IN LIST (Regular LMS — never course_status='Application'): course_status IN ('Form Submitted – Portal Pending','Form Submitted – Completed','Walkin Completed','Walkin Marked','Exam/Interview Scheduled','Offer Letter/Results Pending','Offer Letter/Results Released','Ready For Admission').",
+        "Admission partial exclusion (GLOBAL): AND fee_type NOT IN ('Partial Done','Partial Paid','Partially Paid'). Apply to every query on course_status='Admission'. Do NOT apply to 'Enrolled'.",
+        "'admission'/'admitted' filter: course_status IN ('Admission','Enrolled') AND fee_type NOT IN ('Partial Done','Partial Paid','Partially Paid').",
+        "'enrolled' filter: course_status='Enrolled' ONLY.",
+        "Date-bounded count (any status): WITH first_event AS (SELECT student_id, course_id, MIN(created_at) AS first_event_date FROM course_status_journeys WHERE course_status IN (<statuses>) AND student_id IN (SELECT student_id FROM students) GROUP BY student_id, course_id) SELECT COUNT(DISTINCT student_id) FROM first_event WHERE first_event_date >= CURRENT_DATE - interval '5 hours 30 minutes' AND first_event_date < CURRENT_DATE + interval '1 day' - interval '5 hours 30 minutes'.",
+        "RULE CSJ4 — Admission grouping by time period (monthly/weekly/daily): use MIN(created_at) per student_id ONLY — NOT per (student_id, course_id). A student admitted to multiple courses in same period = ONE admission. GROUP BY student_id only.",
+        "Deposit dedup CTE (Regular LMS — deposit_amount NOT in DISTINCT ON key): SELECT DISTINCT ON (student_id, course_id, fee_type, created_at::DATE) student_id, course_id, deposit_amount, INITCAP(TRIM(fee_type)) AS fee_type_clean FROM course_status_journeys WHERE deposit_amount > 0 AND student_id IN (SELECT student_id FROM students) ORDER BY student_id, course_id, fee_type, created_at::DATE, created_at DESC. ALWAYS use before SUM(deposit_amount).",
+        "fee_type known values (Regular LMS): 'Admission Block', 'Admission Blocked', 'Counselling Yet to be Done'. NULL is valid and common. Normalize with INITCAP(TRIM(...)).",
+        "L3 ownership: assigned_l3_counsellor_id = L3 who OWNS this course journey. counsellor_id on this table = who LOGGED the event (may differ). For L3 performance, always use assigned_l3_counsellor_id.",
+        "Latest status per student-course: DISTINCT ON (student_id, course_id) ORDER BY student_id, course_id, created_at DESC.",
+        "Multiple statuses in pivot: DISTINCT ON (student_id, course_id, course_status) ORDER BY student_id, course_id, course_status, created_at ASC — then date filter on outer query."
+      ]
+    },
+    "student_lead_activities": {
+      "description": "Marketing touchpoints only. One row per activity per student.",
+      "rules": [
+        "Marketing/campaign analysis ONLY. NEVER count students or funnel stages from this table.",
+        "'Leads from Facebook' → students.source ILIKE 'FaceBook%'. 'Activities from Facebook' → this table's source ILIKE 'FaceBook%'.",
+        "Campaign queries: utm_campaign ILIKE '%X%'. NEVER students.source for campaign queries.",
+        "Geographic: ip_city column. One city per student: SELECT student_id, MAX(ip_city) FROM student_lead_activities WHERE ip_city IS NOT NULL AND ip_city != '' GROUP BY student_id.",
+        "working_professional BOOLEAN — use for working professional filters in activity context, not students.current_profession."
+      ]
+    },
+    "counsellor_break_logs": {
+      "description": "Break sessions per counsellor. One row per break.",
+      "rules": [
+        "Ongoing break: break_end IS NULL. duration/duration_seconds/duration_formatted only populated after break ends.",
+        "Always apply IST offset when filtering on break_start or break_end."
+      ]
+    },
+    "lead_assignment_log": {
+      "description": "Audit trail of lead assignments. One row per assignment event.",
+      "rules": [
+        "Multiple rows per student_id — student can be reassigned. Use MAX(created_at) or latest row for current assignment.",
+        "assigned_by values: 'Ruleset Based' or 'Manual'."
+      ]
+    },
+    "l2_assignment_rulesets": {
+      "description": "Lead assignment rules for L2 counsellors.",
+      "rules": [
+        "conditions is JSONB — use ->> or @> to filter. assigned_counsellor_ids is text[] — use ANY() or @>.",
+        "Only query is_active=true unless user asks for inactive/all."
+      ]
+    },
+    "l3_assignment_rulesets": {
+      "description": "Lead assignment rules for L3 counsellors. Regular LMS only — not in Online LMS.",
+      "rules": [
+        "university_name is text[] — use 'Uni Name' = ANY(university_name). assigned_counsellor_ids is text[] — use ANY().",
+        "course_conditions is JSONB with keys: level, degree, stream, courseName, specialization.",
+        "Only query is_active=true unless user asks for inactive/all."
+      ]
+    },
+    "admission_assignment_rulesets": {
+      "description": "Lead assignment rules for admission counsellors.",
+      "rules": [
+        "university_name is text[] — use 'Uni Name' = ANY(university_name). assigned_counsellor_ids is text[] — use ANY().",
+        "course_conditions is JSONB with keys: level, degree, stream, courseName, specialization.",
+        "Only query is_active=true unless user asks for inactive/all."
+      ]
+    }
+  }
+
+}

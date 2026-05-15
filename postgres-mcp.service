@@ -1,0 +1,19 @@
+[Unit]
+Description=PostgreSQL MCP Server
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/postgres-mcp
+EnvironmentFile=/home/ubuntu/postgres-mcp/.env
+ExecStart=/home/ubuntu/postgres-mcp/venv/bin/python server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=postgres-mcp
+
+[Install]
+WantedBy=multi-user.target

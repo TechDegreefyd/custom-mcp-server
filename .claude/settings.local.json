@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:support.claude.com)",
+      "Bash(01_mcp\\\\Scripts\\\\python.exe -c \"import fastmcp; print\\(fastmcp.__version__\\); import inspect; print\\([m for m in dir\\(fastmcp.FastMCP\\) if not m.startswith\\('_'\\)]\\)\")",
+      "Bash(git init *)",
+      "Bash(git branch *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(git config *)",
+      "Bash(gh auth *)",
+      "Bash(git credential-manager *)",
+      "Bash(gh repo *)",
+      "Bash(git commit *)"
+    ]
+  }
+}

@@ -85,7 +85,7 @@ Append-only audit log of every workflow stage transition. Multiple rows per stud
 
 Key columns: id (PK uuid), student_id, team_type (enum), stage, status (`active`/`completed`), assigned_counsellor_id, remark, created_at, updated_at
 
-Stage values by team (validated):
+Stage values by team:
 - **documentation**: Docs Pending, Docs Submitted, Under Verification, Enrolled_L1 Checked, E-sign Pending, Resubmitted, Results Awaited, IDs Created, Rework Required, Refund Applied
   - `IDs Created` exists here but NOT in `students.dip_sub_stage` — student has already left DIP by this point
   - Stage order: Docs Pending → Docs Submitted → Under Verification → Enrolled_L1 Checked → E-sign Pending → Resubmitted/Rework Required → Results Awaited → IDs Created → Refund Applied
@@ -102,7 +102,7 @@ Business rules:
 - **All students have at least one workflow row** — no gaps
 - **Date filtering uses IST cast**: `(sw.created_at AT TIME ZONE 'Asia/Kolkata')::date = 'YYYY-MM-DD'` — this is how the CRM app filters, NOT manual UTC offset math
 - **A student can have multiple workflow rows created on the same day across different stages** — do NOT assume one row per student per day
-- **Documentation Workflows Report counting rule (validated from app source code)**: The app's "TOTAL" column = SUM of per-stage counts, NOT COUNT(DISTINCT student_id). A single student can appear in multiple stage columns if they have workflow rows for multiple stages created on the same date. This is by design — tracks workflow activity, not unique students.
+- **Documentation Workflows Report counting rule**: TOTAL = SUM of per-stage counts, NOT COUNT(DISTINCT student_id). A student in 2 stages on the same day counts as 2 in TOTAL.
 - **No status filter on date-based reports** — the Documentation Workflows Report includes both `active` AND `completed` workflow rows when filtering by date. Do NOT add `AND status = 'active'` when replicating this report.
 
 ---
@@ -120,7 +120,7 @@ Business rules:
 - `is_task = true` rows are tasks, not calls — always exclude from call metrics unless user asks
 - For upcoming callbacks: `callback_at > NOW()`; overdue: `callback_at < NOW() AND callback_at IS NOT NULL`
 - ALWAYS filter `AND student_id IN (SELECT id FROM students)` when not joined to students
-- **Validated: 0 orphaned remarks** — all student_ids in remarks exist in students
+- All student_ids in remarks exist in students — no orphaned rows
 - Almost all students have at least one call remark
 - **stages in remarks include extra values** not in student_workflows: `System Migration`, `Ticketing`, `Ticketing Progress`, `Meeting Rescheduled`, `Placement Call`, `Placement Follow up`, `Placement session` — these are remark-only stages
 - `call_type`: `phone` is the vast majority; `video` calls are rare
@@ -289,6 +289,11 @@ Business rules:
 - Open tickets: `status != 'Resolution — Solved'`
 - Closed tickets: `status = 'Resolution — Solved'`
 - Resolution time: `closed_date - date_raised`
+- **Counsellor link**: `raised_by → users.id` — the counsellor who raised the ticket on behalf of the student
+- **Ticket aging buckets**: `0-3 Days` = days < 3, `3-5 Days` = days BETWEEN 3 AND 5, `> 5 Days` = days > 5
+  - Age = `CURRENT_DATE - (date_raised AT TIME ZONE 'Asia/Kolkata')::date`
+  - Aging is only computed on active (non-solved) tickets
+- **status exact strings**: `'Support'`, `'Resolution — WIP'`, `'Resolution — Solved'` (em-dash `—`, not hyphen)
 
 ---
 
@@ -511,50 +516,34 @@ NEVER mix FK columns. A "servicing counsellor wise" query uses `assigned_servici
 
 ## PATTERNS
 
-### PATTERN 1 — Student Count by Lead Status (Funnel)
-```sql
-SELECT
-    lead_status,
-    COUNT(DISTINCT id) AS student_count
-FROM students
-WHERE lead_status != 'Refunded'   -- exclude unless asked
-GROUP BY lead_status
-ORDER BY
-    CASE lead_status
-        WHEN 'DIP'       THEN 1
-        WHEN 'Enrolled'  THEN 2
-        WHEN 'Onboarded' THEN 3
-        WHEN 'Activated' THEN 4
-        ELSE 5
-    END;
-```
+> Simple GROUP BY queries (funnel counts, DIP sub-stage breakdown, pending installments, open tickets by category, document completeness) are derivable from the table rules above — no pattern needed. Patterns below exist only for non-obvious logic that an agent would likely get wrong.
 
 ---
 
-### PATTERN 2 — DIP Sub-Stage Breakdown
+### PATTERN A — University Report (all variants)
+
+All university reports share the same base. Total always includes Refunded. University in UPPERCASE. Swap the stage columns per variant.
+
+**Variant 1 — Lead Status Funnel** (each status as own column):
 ```sql
-SELECT
-    dip_sub_stage,
-    COUNT(DISTINCT id) AS student_count
-FROM students
-WHERE lead_status = 'DIP'
-GROUP BY dip_sub_stage
-ORDER BY student_count DESC;
+SELECT UPPER(s.university) AS university,
+    COUNT(DISTINCT s.id) AS total,
+    COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP'       THEN s.id END) AS dip,
+    COUNT(DISTINCT CASE WHEN s.lead_status = 'Enrolled'  THEN s.id END) AS enrolled,
+    COUNT(DISTINCT CASE WHEN s.lead_status = 'Onboarded' THEN s.id END) AS onboarded,
+    COUNT(DISTINCT CASE WHEN s.lead_status = 'Activated' THEN s.id END) AS activated,
+    COUNT(DISTINCT CASE WHEN s.lead_status = 'Refunded'  THEN s.id END) AS refunded
+FROM students s GROUP BY UPPER(s.university) ORDER BY total DESC;
 ```
--- NOTE: 'IDs Created' will never appear here — it only exists in student_workflows, not students.dip_sub_stage
 
----
-
-### PATTERN 13 — University-wise Admission Report (Validated)
--- Four mutually exclusive top-level buckets: Enrolled+ | Refunded | Refund Applied | DIP
--- Enrolled+ = Enrolled/Onboarded/Activated | Refund Applied = DIP students with dip_sub_stage='Refund Applied'
--- DIP column = active DIP students excluding Refund Applied sub-stage
--- IDs Created is intentionally excluded — it is a student_workflows stage, NOT a dip_sub_stage on students
+**Variant 2 — Admission Report with DIP sub-stages** (Enrolled+ bucket + Refund Applied split from DIP):
+- `Enrolled+` = Enrolled/Onboarded/Activated
+- `DIP` column excludes Refund Applied (`IS DISTINCT FROM 'Refund Applied'`)
+- `IDs Created` never appears here — it's a `student_workflows` stage only
 ```sql
-SELECT
-    s.university,
-    COUNT(DISTINCT s.id) AS total_admissions,
-    COUNT(DISTINCT CASE WHEN s.lead_status IN ('Enrolled', 'Onboarded', 'Activated') THEN s.id END) AS enrolled_plus,
+SELECT s.university,
+    COUNT(DISTINCT s.id) AS total,
+    COUNT(DISTINCT CASE WHEN s.lead_status IN ('Enrolled','Onboarded','Activated') THEN s.id END) AS enrolled_plus,
     COUNT(DISTINCT CASE WHEN s.lead_status = 'Refunded' THEN s.id END) AS refunded,
     COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage = 'Refund Applied' THEN s.id END) AS refund_applied,
     COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage IS DISTINCT FROM 'Refund Applied' THEN s.id END) AS dip,
@@ -566,217 +555,123 @@ SELECT
     COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage = 'Resubmitted'         THEN s.id END) AS resubmitted,
     COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage = 'Results Awaited'     THEN s.id END) AS results_awaited,
     COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage = 'Enrolled_L1 Checked' THEN s.id END) AS l1_checked
-FROM students s
-GROUP BY s.university
-ORDER BY total_admissions DESC;
+FROM students s GROUP BY s.university ORDER BY total DESC;
 ```
+
+**Variant 3 — + Invoicing Variable (Lakhs)**: JOIN `student_finances` (1-to-1, INNER JOIN safe). Add `ROUND(SUM(CASE WHEN <bucket> THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS <bucket>_L` alongside each count column.
+
+**Variant 4 — Finance Status buckets**: JOIN `student_finances`, pivot on `sf.current_status`. Exact string values: `'To be Invoiced'` | `'Ready to invoice'` | `'Invoiced- Payment Pending'` | `'Invoiced - Payment done'` | `'Refunded Amount'`.
+
+**Variant 5 — Servicing workflow stages** (current active stage per student):
+- ⚠️ Use `student_workflows` NOT `counsellor_tasks` — tasks overcounts General Checkin
+- Servicing stages: `Onboarding` / `Activation` / `General Checkin`
+```sql
+WITH sw AS (
+    SELECT DISTINCT ON (student_id) student_id, stage
+    FROM student_workflows WHERE team_type = 'servicing' AND status = 'active'
+    ORDER BY student_id, created_at DESC
+)
+SELECT UPPER(s.university) AS university, COUNT(DISTINCT s.id) AS total,
+    COUNT(DISTINCT CASE WHEN s.lead_status IN ('Enrolled','Onboarded','Activated') THEN s.id END) AS enrolled_plus,
+    COUNT(DISTINCT CASE WHEN s.lead_status = 'Refunded'       THEN s.id END) AS refunded,
+    COUNT(DISTINCT CASE WHEN sw.stage = 'Onboarding'          THEN s.id END) AS onboarding,
+    COUNT(DISTINCT CASE WHEN sw.stage = 'Activation'          THEN s.id END) AS activation,
+    COUNT(DISTINCT CASE WHEN sw.stage = 'General Checkin'     THEN s.id END) AS general_checkin
+FROM students s LEFT JOIN sw ON s.id = sw.student_id
+GROUP BY UPPER(s.university) ORDER BY total DESC;
+```
+
+**Variant 6 — Placement workflow stages** (same pattern, swap team):
+- Placement stages: `Onboarding` / `Optimization` / `Strategy` / `Ready` / `Mentorship` / `Preparation` / `Placement`
+- Replace `team_type = 'servicing'` → `team_type = 'placement'` in the CTE, then CASE WHEN on placement stages.
 
 ---
 
-### PATTERN 3 — Counsellor-wise Student Count (by team)
+### PATTERN B — Counsellor Performance
+
+**Call metrics** (from `remarks`): always `is_task = false`. `calling_status` is UPPERCASE (`CONNECTED`/`NOT_CONNECTED`).
 ```sql
--- Servicing team: owns Enrolled + Activated students
-SELECT
-    u.name AS counsellor_name,
-    COUNT(DISTINCT s.id) AS total_students,
-    COUNT(DISTINCT CASE WHEN s.lead_status = 'Enrolled'  THEN s.id END) AS enrolled,
-    COUNT(DISTINCT CASE WHEN s.lead_status = 'Onboarded' THEN s.id END) AS onboarded,
-    COUNT(DISTINCT CASE WHEN s.lead_status = 'Activated' THEN s.id END) AS activated
+SELECT u.name, COUNT(r.id) AS total_calls,
+    COUNT(CASE WHEN r.calling_status = 'CONNECTED' THEN 1 END) AS connected,
+    ROUND(COUNT(CASE WHEN r.calling_status = 'CONNECTED' THEN 1 END) * 100.0 / NULLIF(COUNT(r.id),0), 2) AS success_pct
 FROM users u
-LEFT JOIN students s ON u.id = s.assigned_servicing_counsellor_id
-WHERE u.team_type = 'servicing' AND u.is_active = true
-GROUP BY u.id, u.name
-ORDER BY total_students DESC;
-
--- Documentation team: owns DIP students
-SELECT
-    u.name AS counsellor_name,
-    COUNT(DISTINCT s.id) AS total_students,
-    COUNT(DISTINCT CASE WHEN s.dip_sub_stage = 'Docs Pending'       THEN s.id END) AS docs_pending,
-    COUNT(DISTINCT CASE WHEN s.dip_sub_stage = 'Docs Submitted'     THEN s.id END) AS docs_submitted,
-    COUNT(DISTINCT CASE WHEN s.dip_sub_stage = 'Under Verification' THEN s.id END) AS under_verification,
-    COUNT(DISTINCT CASE WHEN s.dip_sub_stage = 'E-sign Pending'     THEN s.id END) AS esign_pending
-FROM users u
-LEFT JOIN students s ON u.id = s.assigned_documentation_counsellor_id AND s.lead_status = 'DIP'
-WHERE u.team_type = 'documentation' AND u.is_active = true
-GROUP BY u.id, u.name
-ORDER BY total_students DESC;
-```
-
-
----
-
-### PATTERN 4 — Call Performance per Counsellor
-```sql
-SELECT
-    u.name AS counsellor_name,
-    COUNT(r.id) AS total_calls,
-    COUNT(CASE WHEN r.calling_status = 'CONNECTED' THEN 1 END) AS connected_calls,
-    ROUND(COUNT(CASE WHEN r.calling_status = 'CONNECTED' THEN 1 END) * 100.0
-          / NULLIF(COUNT(r.id), 0), 2) AS success_rate_pct
-FROM users u
-LEFT JOIN remarks r ON u.id = r.counsellor_id
-    AND r.is_task = false   -- exclude task rows
+LEFT JOIN remarks r ON u.id = r.counsellor_id AND r.is_task = false
 WHERE u.is_active = true
-GROUP BY u.id, u.name
-ORDER BY success_rate_pct DESC;
+GROUP BY u.id, u.name ORDER BY success_pct DESC;
 ```
+
+**Student counts by team** — use correct FK per team (rule T9). Filter `lead_status = 'DIP'` when joining doc counsellors. No `is_active` filter unless user says "active".
+
+**Task completion** (from `counsellor_tasks`): `status = 'pending'` / `'completed'`. Note: General Checkin has 0 completed tasks — skip completion rate for it.
+
+**Overdue callbacks**: `callback_at < NOW()` (no IST offset needed on comparison, but display with `AT TIME ZONE 'Asia/Kolkata'`). Always exclude `is_task = true`.
+
+**Enrollment approval rate** (doc team only): JOIN `enrollment_approvals` via `performed_by`. Approval rate is very high — rejections are rare.
 
 ---
 
-### PATTERN 5 — Document Completeness per Student
+### PATTERN C — Status History (Date-of-Change Lookup)
+⚠️ `student_status_histories` is incomplete — many students have no rows. Only use for "when did X happen", never for counts. Always `MIN(created_at)` per student before date filtering.
 ```sql
-SELECT
-    s.id AS student_id,
-    s.name AS student_name,
-    COUNT(DISTINCT d.id) AS total_docs,
-    COUNT(DISTINCT CASE WHEN d.document_type = 'KYC'      THEN d.id END) AS kyc_docs,
-    COUNT(DISTINCT CASE WHEN d.document_type = 'Academic' THEN d.id END) AS academic_docs,
-    COUNT(DISTINCT CASE WHEN d.document_type = 'Work'     THEN d.id END) AS work_docs,
-    COUNT(DISTINCT CASE WHEN d.document_type = 'Photo'    THEN d.id END) AS photos
-FROM students s
-LEFT JOIN documents d ON s.id = d.student_id
-WHERE s.lead_status = 'DIP'
-GROUP BY s.id, s.name
-ORDER BY total_docs ASC;
-```
-
----
-
-### PATTERN 6 — Pending Installments (Outstanding Collection)
-```sql
-SELECT
-    s.university,
-    COUNT(DISTINCT si.student_id) AS students_with_pending,
-    SUM(si.amount) AS total_pending_amount
-FROM student_installments si
-JOIN students s ON si.student_id = s.id
-WHERE si.status = 'pending'
-GROUP BY s.university
-ORDER BY total_pending_amount DESC;
-```
-
----
-
-### PATTERN 7 — Enrollment Approval Rate per Documentation Counsellor
-```sql
-SELECT
-    u.name AS counsellor_name,
-    COUNT(ea.id) AS total_submitted,
-    COUNT(CASE WHEN ea.status = 'approved' THEN 1 END) AS approved,
-    COUNT(CASE WHEN ea.status = 'rejected' THEN 1 END) AS rejected,
-    ROUND(COUNT(CASE WHEN ea.status = 'approved' THEN 1 END) * 100.0
-          / NULLIF(COUNT(ea.id), 0), 2) AS approval_rate_pct
-FROM users u
-LEFT JOIN enrollment_approvals ea ON u.id = ea.performed_by
-WHERE u.team_type = 'documentation' AND u.is_active = true
-GROUP BY u.id, u.name
-ORDER BY approval_rate_pct DESC;
-```
-
----
-
-### PATTERN 8 — Date-Bounded Status Change Count
-```sql
--- How many students moved to Onboarded today (IST)?
--- ⚠️ student_status_histories is INCOMPLETE — many students have no rows. Use for date-of-change lookups only.
--- For current counts always use students.lead_status.
-WITH first_onboarded AS (
-    SELECT student_id, MIN(created_at) AS first_onboarded_at
-    FROM student_status_histories
-    WHERE status = 'Onboarded'
+WITH first_change AS (
+    SELECT student_id, MIN(created_at) AS changed_at
+    FROM student_status_histories WHERE status = 'Onboarded'  -- swap status as needed
     GROUP BY student_id
 )
-SELECT COUNT(DISTINCT student_id) AS onboarded_today
-FROM first_onboarded
-WHERE first_onboarded_at >= CURRENT_DATE - INTERVAL '5 hours 30 minutes'
-  AND first_onboarded_at <  CURRENT_DATE + INTERVAL '1 day' - INTERVAL '5 hours 30 minutes';
+SELECT COUNT(DISTINCT student_id)
+FROM first_change
+WHERE changed_at >= CURRENT_DATE - INTERVAL '5 hours 30 minutes'
+  AND changed_at <  CURRENT_DATE + INTERVAL '1 day' - INTERVAL '5 hours 30 minutes';
 ```
-Key: Always use `MIN(created_at)` per student before date filtering. **Warning:** this table is incomplete — use `students.lead_status` for total current counts, this table only for when a transition happened.
 
 ---
 
-### PATTERN 9 — Revenue Summary per University
+### PATTERN D — LMS Credentials Breakdown
+⚠️ Includes Refunded students — do NOT filter `lead_status != 'Refunded'`. `not_created` = `false OR NULL`.
 ```sql
-SELECT
-    s.university,
-    COUNT(DISTINCT s.id) AS students,
-    SUM(sf.total_payment_credited) AS total_received,
-    SUM(sf.deficit_amount) AS total_pending,
-    ROUND(AVG(sps.commission_percentage), 2) AS avg_commission_pct
+SELECT COALESCE(u.name, 'UNASSIGNED') AS counsellor,
+    COUNT(DISTINCT s.id) AS total,
+    COUNT(DISTINCT CASE WHEN s.lms_credentials_shared = true THEN s.id END) AS created,
+    COUNT(DISTINCT CASE WHEN s.lms_credentials_shared = false OR s.lms_credentials_shared IS NULL THEN s.id END) AS not_created
 FROM students s
-JOIN student_finances sf ON s.id = sf.student_id
-JOIN student_pricing_snapshots sps ON s.id = sps.student_id
-WHERE s.lead_status != 'Refunded'
-GROUP BY s.university
-ORDER BY total_received DESC;
+LEFT JOIN users u ON s.assigned_servicing_counsellor_id = u.id
+GROUP BY COALESCE(u.name, 'UNASSIGNED') ORDER BY total DESC;
 ```
 
 ---
 
-### PATTERN 10 — Open Tickets by Category
+### PATTERN E — Ticket Reports
+
+**Status breakdown** — counsellor = `raised_by → users.id`. Status exact strings use em-dash: `'Support'` / `'Resolution — WIP'` / `'Resolution — Solved'`.
 ```sql
-SELECT
-    issue_category,
-    status,
-    COUNT(*) AS ticket_count
-FROM tickets
-WHERE status != 'Resolution — Solved'
-GROUP BY issue_category, status
-ORDER BY ticket_count DESC;
+SELECT u.name AS counsellor,
+    COUNT(DISTINCT CASE WHEN t.status = 'Support'              THEN t.id END) AS open_support,
+    COUNT(DISTINCT CASE WHEN t.status = 'Resolution — WIP'    THEN t.id END) AS wip,
+    COUNT(DISTINCT CASE WHEN t.status = 'Resolution — Solved'  THEN t.id END) AS solved,
+    COUNT(DISTINCT t.id) AS total
+FROM tickets t JOIN users u ON t.raised_by = u.id
+GROUP BY u.name ORDER BY total DESC;
 ```
 
----
-
-### PATTERN 11 — Overdue Callbacks per Counsellor
+**Aging breakdown** — active tickets only (`status != 'Resolution — Solved'`). Age = `CURRENT_DATE - (date_raised AT TIME ZONE 'Asia/Kolkata')::date`. Buckets: `< 3` = 0-3 days | `BETWEEN 3 AND 5` = 3-5 days | `> 5` = >5 days.
 ```sql
-SELECT
-    u.name AS counsellor_name,
-    COUNT(DISTINCT r.id) AS overdue_callbacks
-FROM users u
-LEFT JOIN remarks r ON u.id = r.counsellor_id
-    AND r.callback_at < NOW() AT TIME ZONE 'Asia/Kolkata'
-    AND r.callback_at IS NOT NULL
-    AND r.is_task = false
-WHERE u.is_active = true
-GROUP BY u.id, u.name
-ORDER BY overdue_callbacks DESC;
+SELECT u.name AS counsellor,
+    COUNT(DISTINCT CASE WHEN (CURRENT_DATE - (t.date_raised AT TIME ZONE 'Asia/Kolkata')::date) < 3             THEN t.id END) AS "0_3_days",
+    COUNT(DISTINCT CASE WHEN (CURRENT_DATE - (t.date_raised AT TIME ZONE 'Asia/Kolkata')::date) BETWEEN 3 AND 5 THEN t.id END) AS "3_5_days",
+    COUNT(DISTINCT CASE WHEN (CURRENT_DATE - (t.date_raised AT TIME ZONE 'Asia/Kolkata')::date) > 5             THEN t.id END) AS "gt_5_days",
+    COUNT(DISTINCT t.id) AS total_active
+FROM tickets t JOIN users u ON t.raised_by = u.id
+WHERE t.status != 'Resolution — Solved'
+GROUP BY u.name ORDER BY total_active DESC;
 ```
 
 ---
 
-### PATTERN 12 — Task Completion Rate per Counsellor
-```sql
-SELECT
-    u.name AS counsellor_name,
-    ct.assigned_team,
-    COUNT(ct.id) AS total_tasks,
-    COUNT(CASE WHEN ct.status = 'completed' THEN 1 END) AS completed_tasks,
-    COUNT(CASE WHEN ct.status = 'pending'   THEN 1 END) AS pending_tasks,
-    ROUND(COUNT(CASE WHEN ct.status = 'completed' THEN 1 END) * 100.0
-          / NULLIF(COUNT(ct.id), 0), 2) AS completion_rate_pct
-FROM users u
-LEFT JOIN counsellor_tasks ct ON u.id = ct.counsellor_id
-WHERE u.is_active = true
-GROUP BY u.id, u.name, ct.assigned_team
-ORDER BY completion_rate_pct DESC;
-```
-
----
-
-### PATTERN 14 — Documentation Workflows Report (replicated from app source code)
--- **Validated against app export. 100% match.**
--- Source: `getDocumentationWorkflowsReport` backend controller.
---
--- ⚠️ KEY BEHAVIOURS (validated from source code + live data):
--- 1. Date filter: `(sw.created_at AT TIME ZONE 'Asia/Kolkata')::date` — IST cast, NOT manual UTC offset
--- 2. NO status filter — includes BOTH active AND completed workflow rows
--- 3. NO lead_status filter — not restricted to DIP students
--- 4. TOTAL in app = SUM of per-stage counts, NOT COUNT(DISTINCT student_id)
---    → A student with workflow rows in 2 stages on the same day counts as 2 in TOTAL
---    → Example: a student with Docs Pending + Docs Submitted + L1 Checked on the same day counts as 3 in TOTAL
--- 5. For date range query: replace the WHERE clause with BETWEEN
---
+### PATTERN H — Documentation Workflows Report
+-- ⚠️ THREE traps: (1) IST cast `(created_at AT TIME ZONE 'Asia/Kolkata')::date` — NOT manual UTC offset.
+-- (2) NO status filter — includes both active AND completed rows.
+-- (3) TOTAL = SUM of per-stage counts NOT COUNT(DISTINCT student_id) — a student in 2 stages on the same day counts as 2.
+-- For date range: replace `= 'date'` with `BETWEEN 'start' AND 'end'`.
 
 ```sql
 -- Single date
@@ -806,11 +701,9 @@ ORDER BY university;
 
 ---
 
-### PATTERN 15 — Connectivity Metrics Report
--- Filters by `remarks.team_type` NOT `users.team_type` — non-doc users (admin, servicing) who log doc remarks also appear.
--- Two metric views toggled in app — same base query, only the hourly CASE changes:
---   • Remarks view  → hourly counts ALL calls (no calling_status filter in hour buckets)
---   • Connected view → hourly counts CONNECTED only (add `AND r.calling_status = 'CONNECTED'`)
+### PATTERN I — Connectivity Metrics Report
+-- Filter by `remarks.team_type` NOT `users.team_type` (non-team users who log remarks also appear).
+-- Two views: Remarks = all calls per hour bucket | Connected = add `AND r.calling_status = 'CONNECTED'` to hour buckets.
 ```sql
 SELECT
     u.name AS counsellor,
@@ -841,65 +734,9 @@ ORDER BY remarks DESC;
 
 ---
 
-### PATTERN 16 — University Admission Report with Invoicing Variable (Validated)
--- Count + Lakh value per DIP sub-stage bucket. Lakh = student_finances.invoicing_variable ÷ 100,000
--- JOIN: students → student_finances on student_id (1-to-1, INNER JOIN safe)
--- Same bucket logic as PATTERN 13 for counts; amounts use SUM(sf.invoicing_variable) per bucket
--- Validated 100% match against app export.
-```sql
-SELECT
-    s.university,
-    COUNT(DISTINCT s.id) AS total_count,
-    ROUND(SUM(sf.invoicing_variable)::numeric/100000, 2) AS total_L,
-    COUNT(DISTINCT CASE WHEN s.lead_status IN ('Enrolled','Onboarded','Activated') THEN s.id END) AS enrolled_plus_count,
-    ROUND(SUM(CASE WHEN s.lead_status IN ('Enrolled','Onboarded','Activated') THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS enrolled_plus_L,
-    COUNT(DISTINCT CASE WHEN s.lead_status = 'Refunded' THEN s.id END) AS refunded_count,
-    ROUND(SUM(CASE WHEN s.lead_status = 'Refunded' THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS refunded_L,
-    COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage = 'Refund Applied' THEN s.id END) AS refund_applied_count,
-    ROUND(SUM(CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage = 'Refund Applied' THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS refund_applied_L,
-    COUNT(DISTINCT CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage IS DISTINCT FROM 'Refund Applied' THEN s.id END) AS dip_count,
-    ROUND(SUM(CASE WHEN s.lead_status = 'DIP' AND s.dip_sub_stage IS DISTINCT FROM 'Refund Applied' THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS dip_L
-    -- extend with per-sub-stage columns following same CASE WHEN pattern
-FROM students s
-JOIN student_finances sf ON s.id = sf.student_id
-GROUP BY s.university
-ORDER BY total_count DESC;
-```
-
----
-
-### PATTERN 17 — University Finance Status Report (Validated)
--- Buckets by student_finances.current_status with invoicing_variable Lakh values
--- current_status values: 'To be Invoiced' | 'Ready to invoice' | 'Invoiced- Payment Pending' | 'Invoiced - Payment done' | 'Refunded Amount'
--- Validated 100% match against app export.
-```sql
-SELECT
-    s.university,
-    COUNT(DISTINCT s.id) AS total_count,
-    ROUND(SUM(sf.invoicing_variable)::numeric/100000, 2) AS total_L,
-    COUNT(DISTINCT CASE WHEN sf.current_status = 'To be Invoiced'           THEN s.id END) AS to_be_invoiced_count,
-    ROUND(SUM(CASE WHEN sf.current_status = 'To be Invoiced'           THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS to_be_invoiced_L,
-    COUNT(DISTINCT CASE WHEN sf.current_status = 'Ready to invoice'          THEN s.id END) AS ready_to_invoice_count,
-    ROUND(SUM(CASE WHEN sf.current_status = 'Ready to invoice'          THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS ready_to_invoice_L,
-    COUNT(DISTINCT CASE WHEN sf.current_status = 'Invoiced- Payment Pending' THEN s.id END) AS invoiced_pending_count,
-    ROUND(SUM(CASE WHEN sf.current_status = 'Invoiced- Payment Pending' THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS invoiced_pending_L,
-    COUNT(DISTINCT CASE WHEN sf.current_status = 'Invoiced - Payment done'   THEN s.id END) AS invoiced_done_count,
-    ROUND(SUM(CASE WHEN sf.current_status = 'Invoiced - Payment done'   THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS invoiced_done_L,
-    COUNT(DISTINCT CASE WHEN sf.current_status = 'Refunded Amount'           THEN s.id END) AS refunded_count,
-    ROUND(SUM(CASE WHEN sf.current_status = 'Refunded Amount'           THEN sf.invoicing_variable ELSE 0 END)::numeric/100000, 2) AS refunded_L
-FROM students s
-JOIN student_finances sf ON s.id = sf.student_id
-GROUP BY s.university
-ORDER BY total_count DESC;
-```
-
----
-
-### PATTERN 18 — Overall Snapshot Dashboard
--- FTD/MTD   = filter on (s.created_at AT TIME ZONE 'Asia/Kolkata')::date
--- Drive     = s.session = 'July 2026' AND sf.current_status != 'Refunded Amount'
--- YTD       = EXTRACT(YEAR FROM s.admission_taken_date) = 2026 AND excl Refunded Amount
--- Amounts   = total_variable (commission earned) | invoicing_variable (collected so far)
+### PATTERN G — Overall Snapshot Dashboard
+-- FTD/MTD = (s.created_at AT TIME ZONE 'Asia/Kolkata')::date. Drive = session='July 2026'. YTD = admission_taken_date year=2026.
+-- Exclude 'Refunded Amount' from overall/drive/YTD. total_variable = commission earned, invoicing_variable = collected so far.
 ```sql
 SELECT
     COUNT(DISTINCT s.id) FILTER (WHERE sf.current_status != 'Refunded Amount')                                                                                 AS overall_admissions,
@@ -923,3 +760,6 @@ SELECT
 FROM students s
 JOIN student_finances sf ON s.id = sf.student_id;
 ```
+
+---
+

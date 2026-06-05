@@ -1,6 +1,6 @@
 """
 PostgreSQL MCP Server — Multi-DB Edition
-Connects to 4 databases: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+Connects to 5 databases: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
 Exposes PostgreSQL operations as MCP tools over HTTP (Streamable HTTP / SSE)
 Compatible with Claude.ai Integrations and Claude Desktop (Pro/Max/Team/Enterprise)
 """
@@ -62,6 +62,13 @@ DB_CONFIGS: dict[str, dict] = {
         "database": os.getenv("REGULAR_AMITY_LMS_DB_NAME", ""),
         "user":     os.getenv("REGULAR_AMITY_LMS_DB_USER", "postgres"),
         "password": os.getenv("REGULAR_AMITY_LMS_DB_PASSWORD", ""),
+    },
+    "crm": {
+        "host":     os.getenv("CRM_DB_HOST", ""),
+        "port":     int(os.getenv("CRM_DB_PORT", "5432")),
+        "database": os.getenv("CRM_DB_NAME", ""),
+        "user":     os.getenv("CRM_DB_USER", "postgres"),
+        "password": os.getenv("CRM_DB_PASSWORD", ""),
     },
 }
 
@@ -148,12 +155,13 @@ CONTEXT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "context
 mcp = FastMCP(
     name="postgres-mcp",
     instructions=(
-        "This MCP server connects to 4 PostgreSQL databases simultaneously. "
+        "This MCP server connects to 5 PostgreSQL databases simultaneously. "
         "ALWAYS follow this order: "
         "1) Call list_databases — see all DBs, their rulesets, and descriptions. "
         "2) Identify the correct db_name from the user's request: "
         "   online_lms = Online LMS. "
         "   regular_lms / regular_cgc_lms / regular_amity_lms = Regular LMS (CGC/Amity are university-specific). "
+        "   crm = CRM database (customer relationship management). "
         "3) Call get_table_context(db_name, '_global_rules') FIRST — get the universal rules for that DB's ruleset. "
         "4) Call get_table_context(db_name, table_name) for each table you plan to query. "
         "5) Apply ALL ruleset rules when constructing every query. "
@@ -209,7 +217,7 @@ async def list_tables(db_name: str, schema: str = "public") -> str:
     List all tables in the specified database schema.
 
     Args:
-        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
         schema:  Schema name (default: 'public')
 
     Returns:
@@ -318,7 +326,7 @@ async def run_select_query(db_name: str, query: str, params: list[Any] | None = 
     Results are capped at MAX_ROWS rows for safety.
 
     Args:
-        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
         query:   A SQL SELECT / WITH statement. Use $1, $2 … for parameters.
         params:  Optional list of parameter values matching the placeholders.
 
@@ -358,7 +366,7 @@ async def run_write_query(db_name: str, query: str, params: list[Any] | None = N
     The transaction is committed only if no error occurs.
 
     Args:
-        db_name: Database to write to. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+        db_name: Database to write to. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
         query:   SQL DML statement (INSERT / UPDATE / DELETE). Use $1, $2 … for parameters.
         params:  Optional list of parameter values.
 
@@ -400,7 +408,7 @@ async def list_schemas(db_name: str) -> str:
     List all user-defined schemas in the specified database.
 
     Args:
-        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
 
     Returns:
         JSON with schema names, tagged with _source_db.
@@ -465,7 +473,7 @@ async def get_db_stats(db_name: str) -> str:
     top tables by size, and cache hit ratio.
 
     Args:
-        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+        db_name: Database to query. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
 
     Returns:
         JSON with database health metrics, tagged with _source_db.
@@ -522,7 +530,7 @@ async def get_table_context(db_name: str, table_name: str, schema: str = "public
     ALWAYS call get_table_context(db_name, '_global_rules') first, then per table.
 
     Args:
-        db_name:    Database. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms
+        db_name:    Database. One of: online_lms, regular_lms, regular_cgc_lms, regular_amity_lms, crm
         table_name: Table name, or '_global_rules' for universal ruleset rules only
         schema:     Schema name (default: 'public')
 

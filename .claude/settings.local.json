@@ -13,7 +13,14 @@
       "Bash(gh auth *)",
       "Bash(git credential-manager *)",
       "Bash(gh repo *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(\"C:\\\\Users\\\\mohit\\\\OneDrive\\\\Desktop\\\\FRESH START\\\\Custom MCP\\\\01_mcp\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\mohit\\\\OneDrive\\\\Desktop\\\\FRESH START\\\\Custom MCP\\\\server.py\" --transport stdio)",
+      "Bash(claude mcp *)",
+      "mcp__postgres-mcp__list_databases",
+      "mcp__postgres-mcp__list_tables",
+      "mcp__postgres-mcp__get_table_context",
+      "Bash(powershell *)",
+      "mcp__postgres-mcp__run_select_query"
     ]
   }
 }

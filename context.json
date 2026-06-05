@@ -3,7 +3,8 @@
     "online_lms":        { "ruleset": "online",  "description": "Online Lead Management System" },
     "regular_lms":       { "ruleset": "regular", "description": "Regular LMS" },
     "regular_cgc_lms":   { "ruleset": "regular", "description": "Regular LMS — CGC University" },
-    "regular_amity_lms": { "ruleset": "regular", "description": "Regular LMS — Amity University" }
+    "regular_amity_lms": { "ruleset": "regular", "description": "Regular LMS — Amity University" },
+    "crm":               { "ruleset": "crm",     "description": "CRM Database" }
   },
 
   "online": {
@@ -277,6 +278,194 @@
         "university_name is text[] — use 'Uni Name' = ANY(university_name). assigned_counsellor_ids is text[] — use ANY().",
         "course_conditions is JSONB with keys: level, degree, stream, courseName, specialization.",
         "Only query is_active=true unless user asks for inactive/all."
+      ]
+    }
+  },
+
+  "crm": {
+    "_global_rules": {
+      "description": "Universal rules that apply to EVERY query in the CRM database. This is a POST-ADMISSION servicing CRM — students here are already enrolled. Do NOT apply LMS rules, statuses, or counsellor patterns here.",
+      "rules": [
+        "TIMEZONE: All created_at/updated_at store UTC. IST = UTC+5:30. Day filter: WHERE created_at >= CURRENT_DATE - INTERVAL '5 hours 30 minutes' AND created_at < CURRENT_DATE + INTERVAL '1 day' - INTERVAL '5 hours 30 minutes'. callback_at (remarks) is TIMESTAMPTZ — apply IST offset. paid_date (student_installments) is DATE — NEVER apply offset. Display all timestamps as: col AT TIME ZONE 'Asia/Kolkata'.",
+        "COUNTING: ALWAYS COUNT(DISTINCT id) or COUNT(DISTINCT student_id) after JOINs — NEVER COUNT(*) after a JOIN.",
+        "OUTPUT: NEVER SELECT * — always name columns explicitly. Stage breakdowns = wide/pivot format (CASE WHEN per stage, one row per entity). NEVER long format. NEVER return password, phone, or email unless user explicitly requests them. List queries MUST include ORDER BY. NEVER add LIMIT unless user says 'top N' or superlative.",
+        "FUNNEL: Student lifecycle order = DIP → Enrolled → Onboarded → Activated → Refunded. Use students.lead_status for current status. ALWAYS exclude lead_status = 'Refunded' from active counts unless user explicitly includes refunds.",
+        "DIP SUB-STAGES: dip_sub_stage is only meaningful when lead_status = 'DIP'. However Refunded students can also have dip_sub_stage set (e.g. 'Refund Applied', 'Docs Pending') — do not assume dip_sub_stage=NULL for Refunded students.",
+        "USERS/STAFF: ALWAYS JOIN users to get staff names — never construct names from IDs. Filter by name with ILIKE '%Name%' after JOIN — never on base table. ANUPAMA JHA WARNING: exists 3 times with 3 different IDs (servicing supervisor, documentation supervisor, admin null-team). Always disambiguate with AND u.team_type = '<team>' or AND u.role = '<role>'.",
+        "COUNSELLOR FK by team: Servicing → assigned_servicing_counsellor_id. Documentation → assigned_documentation_counsellor_id. Placement → assigned_placement_counsellor_id. Sales → assigned_sales_counsellor_id. NEVER mix FK columns across teams.",
+        "CHILD SAFETY: If students table is NOT JOINed in a query on child tables (remarks, student_workflows, documents, etc.), add: AND student_id IN (SELECT id FROM students).",
+        "STUDENT PK: students.id format is 'STD-XXXXXXXX'. FK in child tables is student_id → students.id. NEVER confuse id with student_id.",
+        "SOURCE CASING: students.source has inconsistent casing ('FaceBook'/'Facebook', 'student_ref'/'Student_Ref'). ALWAYS use ILIKE for source filtering.",
+        "PAYMENT MODE / FEE TYPE: Always use UPPER() or ILIKE for payment_mode and fee_type — casing is inconsistent across rows.",
+        "ARRAYS: students.languages is a PostgreSQL ARRAY — use 'Value' = ANY(languages) for filtering."
+      ]
+    },
+    "students": {
+      "description": "Central record for enrolled students. One row per student. PK = id (STD-XXXXXXXX format).",
+      "rules": [
+        "lead_status enum (current funnel stage): 'DIP', 'Enrolled', 'Onboarded', 'Activated', 'Refunded'. ALWAYS use this for funnel counts — NEVER lms_status.",
+        "dip_sub_stage values: 'Docs Pending', 'Docs Submitted', 'Under Verification', 'Enrolled_L1 Checked', 'E-sign Pending', 'Resubmitted', 'Results Awaited', 'Rework Required', 'Refund Applied', 'Completed', 'Enrolled'. Only filter this when lead_status = 'DIP'. NOTE: 'IDs Created' does NOT exist in this column — it only exists in student_workflows.stage.",
+        "student_created_at = when student originally entered system (from LMS). created_at = when CRM record was created. admission_taken_date = date of admission. enrollment_date = date of enrollment confirmation.",
+        "session values: 'Jan 2026', 'July 2026'.",
+        "source has casing inconsistencies — always use ILIKE. Top sources: FaceBook (~142), Google_Lead_Form (111), FaceBook_University_Admit (91), Landing Page (54).",
+        "languages is a PostgreSQL ARRAY — use 'Value' = ANY(languages).",
+        "Boolean flags: review_link_sent, lms_credentials_shared, calendar_link_sent, resume_optimized, linkedin_optimized, classes_started, review_posted, instagram_posted, gap."
+      ]
+    },
+    "users": {
+      "description": "CRM staff members. One row per user. PK = id (hex string like '9643B571D1').",
+      "rules": [
+        "role enum: 'admin', 'supervisor', 'counsellor'.",
+        "team_type enum: 'servicing', 'placement', 'documentation'. admin role users often have NULL team_type — do not assume all users have a team.",
+        "ALWAYS JOIN users for staff names. NEVER construct names from IDs.",
+        "Filter active staff: is_active = true (only when user says 'active').",
+        "Supervisor: role = 'supervisor' or check supervisor_id chain.",
+        "ANUPAMA JHA exists 3 times with different IDs and team types — always add AND u.team_type = '<team>' or AND u.role = '<role>' when filtering by name.",
+        "NEVER SELECT password column."
+      ]
+    },
+    "student_workflows": {
+      "description": "Append-only audit log of workflow stage transitions. Multiple rows per student.",
+      "rules": [
+        "APPEND-ONLY — ALWAYS deduplicate before date-filtering. Use MIN(created_at) or DISTINCT ON.",
+        "team_type values: 'documentation', 'servicing', 'placement', 'admin'.",
+        "Stage values by team — documentation: 'Docs Pending', 'Docs Submitted', 'Under Verification', 'Enrolled_L1 Checked', 'E-sign Pending', 'Resubmitted', 'Results Awaited', 'IDs Created', 'Rework Required', 'Refund Applied'. servicing: 'Onboarding', 'Activation', 'General Checkin'. placement: 'Onboarding', 'Optimization', 'Strategy'. admin: 'Enrollment Approval Required'.",
+        "IDs Created exists here but NOT in students.dip_sub_stage — student has already left DIP by this stage.",
+        "status = 'active' means stage in progress; 'completed' means done.",
+        "Current stage per student: DISTINCT ON (student_id) ORDER BY student_id, created_at DESC.",
+        "Date filtering uses IST cast: (sw.created_at AT TIME ZONE 'Asia/Kolkata')::date = 'YYYY-MM-DD'. Do NOT use manual UTC offset math.",
+        "No status filter on date-based Documentation Workflows Report — include both active AND completed rows. Do NOT add AND status = 'active' when replicating that report.",
+        "Documentation Workflows Report TOTAL = SUM of per-stage counts, NOT COUNT(DISTINCT student_id). A student with workflows in multiple stages on the same day counts multiple times — this is intentional.",
+        "NEVER count students from this table — always use the students table."
+      ]
+    },
+    "remarks": {
+      "description": "Call/interaction log. Multiple rows per student.",
+      "rules": [
+        "calling_status is UPPERCASE: 'CONNECTED' / 'NOT_CONNECTED'. NEVER lowercase.",
+        "call_type values: 'phone' (vast majority), 'video' (rare).",
+        "is_task = true rows are tasks, not calls — ALWAYS exclude from call metrics unless user explicitly asks for tasks.",
+        "callback_at is TIMESTAMPTZ — apply IST offset when filtering by date. This differs from LMS callback_date which is a DATE.",
+        "Overdue callbacks: callback_at < NOW() AT TIME ZONE 'Asia/Kolkata' AND callback_at IS NOT NULL. Upcoming: callback_at > NOW().",
+        "Success rate = COUNT(CASE WHEN calling_status='CONNECTED' THEN 1 END) / COUNT(DISTINCT id).",
+        "ALWAYS COUNT(DISTINCT id) after JOINs — never COUNT(*).",
+        "ALWAYS filter AND student_id IN (SELECT id FROM students) when not joined to students table. (Validated: 0 orphaned remarks.)",
+        "stage column includes extra remark-only values not in student_workflows: 'System Migration', 'Ticketing', 'Ticketing Progress', 'Meeting Rescheduled', 'Placement Call', 'Placement Follow up', 'Placement session'."
+      ]
+    },
+    "student_status_histories": {
+      "description": "Append-only audit of lead_status changes. INCOMPLETE — many students have no rows.",
+      "rules": [
+        "Use ONLY for 'when did student become X' queries (date of status change). For current status → students.lead_status.",
+        "status values: 'DIP', 'Enrolled', 'Onboarded', 'Activated', 'Refunded'.",
+        "First occurrence of a status: MIN(created_at) per student filtered by status.",
+        "Refund reason: check remarks column (contains text like 'Refund Processed: ...').",
+        "INCOMPLETE TABLE — many students have NO rows here. NEVER use to count students at a status. Use students.lead_status for total counts."
+      ]
+    },
+    "enrollment_approvals": {
+      "description": "Manager approval/rejection records for enrollments. One row per approval event.",
+      "rules": [
+        "status enum: 'approved' / 'rejected'.",
+        "performed_by = documentation counsellor who submitted. manager_id = supervisor who approved/rejected.",
+        "Approval rate: COUNT(CASE WHEN status='approved' THEN 1 END) / COUNT(*). Rate is very high — almost all get approved.",
+        "performed_by is sparse — only a small number of counsellors have submitted approvals."
+      ]
+    },
+    "documents": {
+      "description": "Student documents uploaded for enrollment. Multiple rows per student.",
+      "rules": [
+        "document_type values: 'Academic', 'KYC', 'L1 Checked Document', 'Photo', 'Work'.",
+        "uploaded_by → users.id (documentation counsellor who uploaded).",
+        "NEVER return file_url unless user explicitly asks.",
+        "Many students have no documents yet — document coverage is incomplete."
+      ]
+    },
+    "counsellor_tasks": {
+      "description": "Pending/completed structured tasks per counsellor.",
+      "rules": [
+        "name enum: 'Onboarding', 'Placement Follow up', 'General Checkin', 'Activation'.",
+        "assigned_team enum: 'servicing', 'placement'. Placement Follow up appears under both.",
+        "status enum: 'pending' / 'completed'.",
+        "General Checkin has 0 completed tasks — do not compute completion rate for it.",
+        "count = number of interactions on the task. last_action_at = last time counsellor acted.",
+        "Task completion rate: COUNT(CASE WHEN status='completed' THEN 1 END) / COUNT(*). For call metrics → use remarks table, NOT this table."
+      ]
+    },
+    "student_finances": {
+      "description": "Financial record per student. One row per student.",
+      "rules": [
+        "JOIN on student_id. Every student has exactly 1 row — INNER JOIN is safe.",
+        "total_payment_credited = total money received from university. deficit_amount = amount still pending from university.",
+        "current_status values: 'To be Invoiced', 'Ready to invoice', 'Invoiced- Payment Pending', 'Invoiced - Payment done', 'Refunded Amount'.",
+        "fee_type and payment_mode have inconsistent casing — ALWAYS use ILIKE or UPPER().",
+        "is_eligible_for_payment: whether university has cleared the student for payment.",
+        "invoicing_variable and total_variable = commission components. Lakh conversion: ROUND(SUM(invoicing_variable)::numeric/100000, 2)."
+      ]
+    },
+    "student_installments": {
+      "description": "EMI/installment schedule per student. Multiple rows per student (~2 avg).",
+      "rules": [
+        "JOIN to student_finances via finance_id.",
+        "status enum: 'pending', 'invoiced', 'paid'.",
+        "period values: 'Full Payment', 'Year', 'Year 1', 'Year 2', 'Year 3', 'Semester 1' through 'Semester 6'.",
+        "paid_date is type DATE — NEVER apply timezone offset.",
+        "Pending collections: WHERE status = 'pending'. SUM(amount) WHERE status='pending' = total outstanding."
+      ]
+    },
+    "student_pricing_snapshots": {
+      "description": "Locked fee/commission structure at time of enrollment. One row per student.",
+      "rules": [
+        "Every student has exactly 1 row — INNER JOIN is safe.",
+        "Use for commission calculations — NOT course_fee_master (which is catalog data).",
+        "commission_percentage = Degreefyd's commission % for this student's enrollment, locked at admission.",
+        "is_locked = true means rates are frozen and should not change."
+      ]
+    },
+    "student_revenue_items": {
+      "description": "Revenue breakdown per finance record. Two rows per student.",
+      "rules": [
+        "label values: 'Invoicing Variable', 'Total Variable'. Always two rows per student.",
+        "is_received = true means payment received from university.",
+        "collected_amount = actual amount collected.",
+        "JOIN to student_finances via finance_id for university/course context."
+      ]
+    },
+    "course_fee_master": {
+      "description": "Master catalog of course fees per university. Use for catalog lookups only.",
+      "rules": [
+        "Use for catalog/master fee lookup — NOT for individual student fee (use student_pricing_snapshots for that).",
+        "ALWAYS filter is_active = true unless user asks for all/inactive courses.",
+        "University name matching: use ILIKE '%University Name%' — casing inconsistent (e.g. 'Galgotia' vs 'Galgotias').",
+        "university_name values: 'Amity University Online', 'Chandigarh University Online', 'Galgotias University Online', 'GLA University Online', 'Lovely Professional University Online', 'Manipal University Online', 'Shoolini University online', 'Sikkim Manipal University Online', 'Vivekanand Global University Online'."
+      ]
+    },
+    "college_onboardings": {
+      "description": "University partnership config. One row per partner university.",
+      "rules": [
+        "course_commissions is JSONB with per-course commission overrides — use ->> for key access.",
+        "global_discounts and course_discounts are JSONB.",
+        "billing_cycle = 'Monthly' for all current universities.",
+        "For individual student commission → use student_pricing_snapshots.commission_percentage (locked at enrollment), NOT this table."
+      ]
+    },
+    "tickets": {
+      "description": "Student support tickets. PK = id (TKT-2026-XXXX format).",
+      "rules": [
+        "issue_category enum: 'Academic', 'LMS', 'Other'.",
+        "status flow: 'Support' → 'Resolution — WIP' → 'Resolution — Solved'.",
+        "Open tickets: status != 'Resolution — Solved'. Closed: status = 'Resolution — Solved'.",
+        "Resolution time: closed_date - date_raised.",
+        "raised_by → users.id."
+      ]
+    },
+    "notifications": {
+      "description": "System notifications per user. High volume table.",
+      "rules": [
+        "ALWAYS add a date filter or LIMIT — high row count, avoid full scans.",
+        "type enum: 'Approval', 'SLA', 'Success', 'Error', 'Task'.",
+        "is_read = false = unread notifications.",
+        "metadata is JSONB — use ->> for key access."
       ]
     }
   }

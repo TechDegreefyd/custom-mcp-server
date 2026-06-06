@@ -259,8 +259,6 @@ Rules:
 
 **S5.** ALWAYS COUNT(DISTINCT student_id) after JOIN. Never COUNT(*).
 
-**S6.** same as S2 — enforced globally.
-
 **S7.** "region" in context of university/forms/admissions → university_courses.university_state. Never students.student_current_state.
 
 **S8.** Time-slot / hourly queries → EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata') on student_remarks. Performance = Connected rate only. Always HAVING COUNT(*) > 0. LIMIT 1 for single best/worst.
@@ -358,13 +356,6 @@ NEVER count forms from students table.
 
 ---
 
-### Timezone Rules
-
-**TZ1.** Always apply - INTERVAL '5 hours 30 minutes' to any created_at date boundary filter.
-**TZ2.** callback_date is type DATE — NEVER apply timezone offset.
-**TZ3.** Display timestamps: AT TIME ZONE 'Asia/Kolkata'. Never raw UTC.
-**TZ4.** Hour extraction: EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata').
-
 ---
 
 ## DISTINCTIONS
@@ -398,14 +389,6 @@ NEVER use students.current_student_status for form/admission/enrolled stages. NE
 | "enrollment" / "enrolled" | course_status = 'Enrolled' ONLY — NOT Admission |
 
 Admission includes Enrolled (enrolled students are admitted). Enrollment does NOT include Admission.
-
----
-
-### D4 — Partial Exclusion (Regular vs Online differs)
-Regular LMS exclusion list: 'Partial Done', 'Partial Paid', 'Partially Paid'
-Enrolled is CLEAN — no fee_type filter needed.
-'Registration done' is NOT partial — include unless user says otherwise.
-NEVER add OR fee_type IS NULL.
 
 ---
 

@@ -188,10 +188,9 @@ created_at AT TIME ZONE 'Asia/Kolkata'
 **O4.** Counsellor performance queries MUST include `total_students` or `total_calls` as base column.
 **O5.** Benchmark comparison queries MUST include the benchmark value as an explicit output column.
 **O6.** Only return columns the user explicitly asked for. RULE O3 applies ONLY to dormant/follow-up queries - do NOT add extra columns to general listings.
-
-**O9 (PRIVACY).** NEVER SELECT `student_phone`, `student_email`, or any other PII column under any circumstances — including dormant/follow-up queries, "student details", or "student info" requests. If the user explicitly names these columns in their question, respond that PII columns are restricted. No exceptions.
 **O7.** List queries MUST include ORDER BY. Use `created_at DESC` for call records unless specified.
 **O8.** Any date/timestamp returned to user MUST be converted to IST: `AT TIME ZONE 'Asia/Kolkata'`. Always use `MIN(created_at)` (not raw) when selecting event dates from append-only tables.
+**O9 (PRIVACY).** NEVER SELECT `student_phone`, `student_email`, or any other PII column under any circumstances — including dormant/follow-up queries, "student details", or "student info" requests. If the user explicitly names these columns in their question, respond that PII columns are restricted. No exceptions.
 
 ---
 
@@ -683,8 +682,8 @@ INNER JOIN intentional. Switch to LEFT JOIN if user wants all counsellors.
 
 ### PATTERN 12 - Attempted Calls / Total Leads on New Students (Counsellor-wise)
 Date filter in JOIN ON clause - not WHERE. `WHERE sr.student_id IS NOT NULL` intentional (only counsellors who attempted appear).
-- PATTERN 14 (attempted only): remove `COUNT(DISTINCT s.student_id) AS total_leads`
-- PATTERN 15 (total + attempted): keep both counts
+- **Variant A (attempted only):** remove `COUNT(DISTINCT s.student_id) AS total_leads`
+- **Variant B (total + attempted):** keep both counts
 ```sql
 SELECT c.counsellor_name,
     COUNT(DISTINCT s.student_id) AS total_leads,
@@ -967,85 +966,6 @@ WHERE csj.course_status = 'Admission'
 GROUP BY uc.university_name, COALESCE(sc.campaign, 'Direct/Organic')
 ORDER BY admission_count DESC;
 ```
-
----
-
-## FEW-SHOT EXAMPLES
-
----
-
-**Q: Top 10 counsellors with most students and breakdown by stage.**
-```sql
-SELECT
-    c.counsellor_name,
-    COUNT(DISTINCT s.student_id) AS total_students,
-    COUNT(DISTINCT CASE WHEN s.current_student_status = 'Pre Application' THEN s.student_id END) AS pre_application,
-    COUNT(DISTINCT CASE WHEN s.current_student_status = 'Initial Counselling Completed' THEN s.student_id END) AS counselling_completed,
-    COUNT(DISTINCT CASE WHEN csj.course_status = 'Application' THEN csj.student_id END) AS applications,
-    COUNT(DISTINCT CASE WHEN csj.course_status IN ('Admission','Enrolled') AND (csj.course_status = 'Enrolled' OR csj.fee_type NOT IN ('partial paid','Partially Paid','Partial Done')) THEN csj.student_id END) AS admissions,
-    COUNT(DISTINCT CASE WHEN csj.course_status = 'Enrolled' THEN csj.student_id END) AS enrolled
-FROM counsellors c
-JOIN students s ON c.counsellor_id = s.assigned_counsellor_id
-LEFT JOIN course_status_journeys csj ON s.student_id = csj.student_id
-GROUP BY c.counsellor_id, c.counsellor_name
-HAVING COUNT(DISTINCT s.student_id) > 0
-ORDER BY total_students DESC LIMIT 10;
-```
-
----
-
-**Q: For each counsellor - admissions, remarks, callbacks, conversion rate.**
-```sql
-SELECT
-    c.counsellor_name,
-    COUNT(DISTINCT s.student_id) AS total_students,
-    COUNT(DISTINCT CASE WHEN csj.course_status IN ('Admission','Enrolled') AND (csj.course_status = 'Enrolled' OR csj.fee_type NOT IN ('partial paid','Partially Paid','Partial Done')) THEN csj.student_id END) AS converted_students,
-    COUNT(DISTINCT sr.remark_id) AS total_remarks,
-    COUNT(DISTINCT CASE WHEN sr.callback_date >= CURRENT_DATE THEN sr.remark_id END) AS upcoming_callbacks,
-    COUNT(DISTINCT CASE WHEN sr.callback_date < CURRENT_DATE THEN sr.remark_id END) AS overdue_callbacks,
-    ROUND(COUNT(DISTINCT CASE WHEN csj.course_status IN ('Admission','Enrolled') AND (csj.course_status = 'Enrolled' OR csj.fee_type NOT IN ('partial paid','Partially Paid','Partial Done')) THEN csj.student_id END)::numeric / NULLIF(COUNT(DISTINCT s.student_id), 0) * 100, 2) AS conversion_rate_pct
-FROM counsellors c
-JOIN students s ON c.counsellor_id = s.assigned_counsellor_id
-LEFT JOIN course_status_journeys csj ON s.student_id = csj.student_id
-LEFT JOIN student_remarks sr ON s.student_id = sr.student_id AND sr.counsellor_id = c.counsellor_id
-GROUP BY c.counsellor_id, c.counsellor_name
-HAVING COUNT(DISTINCT s.student_id) > 0
-ORDER BY total_students DESC;
-```
-
----
-
-**Q: Counsellors above/below team average conversion rate.**
-```sql
-WITH counsellor_metrics AS (
-    SELECT c.counsellor_id, c.counsellor_name,
-        COUNT(DISTINCT s.student_id) AS total_students,
-        ROUND(COUNT(DISTINCT CASE WHEN csj.course_status IN ('Admission','Enrolled') AND (csj.course_status = 'Enrolled' OR csj.fee_type NOT IN ('partial paid','Partially Paid','Partial Done')) THEN csj.student_id END)::numeric / NULLIF(COUNT(DISTINCT s.student_id), 0) * 100, 2) AS conversion_rate_pct
-    FROM counsellors c
-    JOIN students s ON c.counsellor_id = s.assigned_counsellor_id
-    LEFT JOIN course_status_journeys csj ON s.student_id = csj.student_id
-    GROUP BY c.counsellor_id, c.counsellor_name HAVING COUNT(DISTINCT s.student_id) > 0
-),
-benchmark AS (SELECT ROUND(AVG(conversion_rate_pct),2) AS avg_r, ROUND(STDDEV(conversion_rate_pct),2) AS std_r FROM counsellor_metrics)
-SELECT cm.counsellor_name, cm.total_students, cm.conversion_rate_pct,
-    b.avg_r AS team_avg_pct, ROUND(cm.conversion_rate_pct - b.avg_r, 2) AS diff_from_avg,
-    CASE WHEN cm.conversion_rate_pct >= b.avg_r + b.std_r THEN 'Above Average'
-         WHEN cm.conversion_rate_pct <= b.avg_r - b.std_r THEN 'Below Average'
-         ELSE 'Average' END AS performance_band
-FROM counsellor_metrics cm CROSS JOIN benchmark b ORDER BY cm.conversion_rate_pct DESC;
-```
-
----
-
-**Q: Monthly lead counts over last 6 months by source.**
-```sql
-SELECT DATE_TRUNC('month', s.created_at) AS month, s.source, COUNT(*) AS lead_count
-FROM students s
-WHERE s.created_at >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '5 months')
-GROUP BY DATE_TRUNC('month', s.created_at), s.source
-ORDER BY month DESC, lead_count DESC;
-```
-`COUNT(*)` correct here - each student row is one lead, no JOIN.
 
 ---
 

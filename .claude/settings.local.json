@@ -22,5 +22,8 @@
       "Bash(powershell *)",
       "mcp__postgres-mcp__run_select_query"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "postgres-mcp"
+  ]
 }
